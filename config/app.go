@@ -18,28 +18,44 @@ func NewApp(db *pgxpool.Pool) *fiber.App {
 		AppName: GetEnv("APP_NAME", "FoundNear"),
 	})
 
-	// Security and request middleware
+	// Security and request middleware.
 	app.Use(requestid.New())
 	app.Use(middleware.Recovery())
 	app.Use(cors.New())
 	app.Use(helmet.New())
 	app.Use(middleware.RequestLogger())
 
-	// Initialize repositories
+	// Initialize repositories.
 	userRepo := repository.NewUserRepository(db)
 	roleRepo := repository.NewRoleRepository(db)
+	reportRepo := repository.NewReportRepository(db)
+	categoryRepo := repository.NewCategoryRepository(db)
+	claimRepo := repository.NewClaimRepository(db)
 
-	// Initialize services
+	// Initialize services.
 	jwtSecret := GetEnv("JWT_SECRET", "")
+
 	authService := service.NewAuthService(
 		userRepo,
 		roleRepo,
 		jwtSecret,
 	)
 
-	// Register routes
+	reportService := service.NewReportService(
+		reportRepo,
+		categoryRepo,
+	)
+
+	claimService := service.NewClaimService(
+		claimRepo,
+		reportRepo,
+	)
+
+	// Register routes.
 	route.RegisterHealthRoute(app)
 	route.RegisterAuthRoute(app, authService, jwtSecret)
+	route.RegisterReportRoute(app, reportService, jwtSecret)
+	route.RegisterClaimRoute(app, claimService, jwtSecret)
 
 	return app
 }

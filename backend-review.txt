@@ -1,0 +1,480 @@
+﻿
+========== middleware\jwt.go ==========
+
+package middleware
+
+import (
+	"strings"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/golang-jwt/jwt/v5"
+)
+
+type JWTClaims struct {
+	UserID int64  `json:"user_id"`
+	Role   string `json:"role"`
+	jwt.RegisteredClaims
+}
+
+func RequireAuth(secret string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		if secret == "" {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"status":  "error",
+				"message": "JWT configuration is missing",
+			})
+		}
+
+		authHeader := c.Get("Authorization")
+
+		if authHeader == "" {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"status":  "error",
+				"message": "Authorization token is required",
+			})
+		}
+
+		parts := strings.SplitN(authHeader, " ", 2)
+
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"status":  "error",
+				"message": "Invalid authorization format",
+			})
+		}
+
+		claims := new(JWTClaims)
+
+		token, err := jwt.ParseWithClaims(
+			parts[1],
+			claims,
+			func(token *jwt.Token) (interface{}, error) {
+				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+					return nil, fiber.ErrUnauthorized
+				}
+
+				return []byte(secret), nil
+			},
+		)
+
+		if err != nil || token == nil || !token.Valid ||
+			claims.UserID <= 0 || claims.Role == "" {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"status":  "error",
+				"message": "Invalid or expired token",
+			})
+		}
+
+		c.Locals("user_id", claims.UserID)
+		c.Locals("role", claims.Role)
+
+		return c.Next()
+	}
+}
+
+func RequireRole(roles ...string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		userRole, ok := c.Locals("role").(string)
+
+		if !ok {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"status":  "error",
+				"message": "Authentication required",
+			})
+		}
+
+		for _, role := range roles {
+			if strings.EqualFold(userRole, role) {
+				return c.Next()
+			}
+		}
+
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"status":  "error",
+			"message": "You do not have permission to access this resource",
+		})
+	}
+}
+
+========== route\auth.go ==========
+package route
+
+import (
+	"foundnear/app/service"
+	"foundnear/middleware"
+
+	"github.com/gofiber/fiber/v2"
+)
+
+func RegisterAuthRoute(
+	app *fiber.App,
+	authService *service.AuthService,
+	jwtSecret string,
+) {
+	auth := app.Group("/api/v1/auth")
+
+	auth.Post("/register", authService.Register)
+	auth.Post("/login", authService.Login)
+
+	auth.Get(
+		"/me",
+		middleware.RequireAuth(jwtSecret),
+		authService.Me,
+	)
+}
+
+========== app\service\auth_service.go ==========
+package service
+
+import (
+	"errors"
+	"strings"
+	"time"
+
+	"foundnear/app/model"
+	"foundnear/app/repository"
+	"foundnear/helper"
+	"foundnear/middleware"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/golang-jwt/jwt/v5"
+)
+
+type AuthService struct {
+	userRepo  repository.UserRepository
+	roleRepo  repository.RoleRepository
+	jwtSecret string
+}
+
+func NewAuthService(
+	userRepo repository.UserRepository,
+	roleRepo repository.RoleRepository,
+	jwtSecret string,
+) *AuthService {
+	return &AuthService{
+		userRepo:  userRepo,
+		roleRepo:  roleRepo,
+		jwtSecret: jwtSecret,
+	}
+}
+
+// Register menangani pendaftaran akun baru.
+func (s *AuthService) Register(c *fiber.Ctx) error {
+	var req model.RegisterRequest
+
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"status":  "error",
+			"message": "Invalid request body",
+		})
+	}
+
+	req.Name = strings.TrimSpace(req.Name)
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+	req.Phone = strings.TrimSpace(req.Phone)
+
+	if err := helper.ValidateRegister(req.Name, req.Email, req.Password); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"status":  "error",
+			"message": err.Error(),
+		})
+	}
+
+	// Hash password sebelum disimpan ke database.
+	passwordHash, err := helper.HashPassword(req.Password)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"status":  "error",
+			"message": "Failed to process password",
+		})
+	}
+
+	// Ambil role default untuk pengguna baru.
+	role, err := s.roleRepo.GetRoleByName(c.UserContext(), model.RoleUser)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"status":  "error",
+			"message": "Failed to get default user role",
+		})
+	}
+
+	var phone *string
+	if req.Phone != "" {
+		phone = &req.Phone
+	}
+
+	user := &model.User{
+		RoleID:       role.ID,
+		RoleName:     role.Name,
+		Name:         req.Name,
+		Email:        req.Email,
+		PasswordHash: passwordHash,
+		Phone:        phone,
+	}
+
+	if err := s.userRepo.CreateUser(c.UserContext(), user); err != nil {
+		if errors.Is(err, model.ErrDuplicate) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"status":  "error",
+				"message": "Email is already registered",
+			})
+		}
+
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"status":  "error",
+			"message": "Failed to register user",
+		})
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+		"status":  "success",
+		"message": "Registration successful",
+		"data":    toUserProfile(user),
+	})
+}
+
+// Login memverifikasi kredensial dan menghasilkan JWT.
+func (s *AuthService) Login(c *fiber.Ctx) error {
+	var req model.LoginRequest
+
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"status":  "error",
+			"message": "Invalid request body",
+		})
+	}
+
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+
+	if err := helper.ValidateLogin(req.Email, req.Password); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"status":  "error",
+			"message": err.Error(),
+		})
+	}
+
+	user, err := s.userRepo.GetUserByEmail(c.UserContext(), req.Email)
+	if err != nil {
+		if errors.Is(err, model.ErrNotFound) {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"status":  "error",
+				"message": "Invalid email or password",
+			})
+		}
+
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"status":  "error",
+			"message": "Failed to retrieve user",
+		})
+	}
+
+	if !helper.CheckPassword(req.Password, user.PasswordHash) {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"status":  "error",
+			"message": "Invalid email or password",
+		})
+	}
+
+	if s.jwtSecret == "" {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"status":  "error",
+			"message": "JWT configuration is missing",
+		})
+	}
+
+	claims := middleware.JWTClaims{
+		UserID: user.ID,
+		Role:   user.RoleName,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "user",
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString([]byte(s.jwtSecret))
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"status":  "error",
+			"message": "Failed to generate access token",
+		})
+	}
+
+	response := model.AuthResponse{
+		AccessToken: tokenString,
+		TokenType:   "Bearer",
+		User:        toUserProfile(user),
+	}
+
+	return c.JSON(fiber.Map{
+		"status":  "success",
+		"message": "Login successful",
+		"data":    response,
+	})
+}
+
+// Me mengambil profil pengguna berdasarkan JWT.
+func (s *AuthService) Me(c *fiber.Ctx) error {
+	userID, ok := c.Locals("user_id").(int64)
+	if !ok || userID <= 0 {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"status":  "error",
+			"message": "Invalid user authentication",
+		})
+	}
+
+	user, err := s.userRepo.GetUserByID(c.UserContext(), userID)
+	if err != nil {
+		if errors.Is(err, model.ErrNotFound) {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"status":  "error",
+				"message": "User not found",
+			})
+		}
+
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"status":  "error",
+			"message": "Failed to retrieve user profile",
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"status":  "success",
+		"message": "Profile retrieved successfully",
+		"data":    toUserProfile(user),
+	})
+}
+
+func toUserProfile(user *model.User) model.UserProfile {
+	return model.UserProfile{
+		ID:    user.ID,
+		Name:  user.Name,
+		Email: user.Email,
+		Role:  user.RoleName,
+	}
+}
+
+========== main.go ==========
+package main
+
+import (
+	"context"
+	"log"
+
+	"foundnear/config"
+	"foundnear/database"
+)
+
+func main() {
+	config.LoadEnv()
+	config.InitLogger()
+
+	// Initialize PostgreSQL connection
+	ctx := context.Background()
+
+	db, err := database.NewPostgresPool(
+		ctx,
+		config.GetDatabaseURL(),
+	)
+	if err != nil {
+		log.Fatalf("Failed to connect to PostgreSQL: %v", err)
+	}
+	defer db.Close()
+
+	// Initialize Fiber application
+	app := config.NewApp(db)
+
+	port := config.GetEnv("APP_PORT", "3000")
+
+	log.Printf("FoundNear server running on port %s", port)
+
+	if err := app.Listen(":" + port); err != nil {
+		log.Fatal(err)
+	}
+}
+
+========== config\app.go ==========
+package config
+
+import (
+	"foundnear/app/repository"
+	"foundnear/app/service"
+	"foundnear/middleware"
+	"foundnear/route"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/helmet"
+	"github.com/gofiber/fiber/v2/middleware/requestid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func NewApp(db *pgxpool.Pool) *fiber.App {
+	app := fiber.New(fiber.Config{
+		AppName: GetEnv("APP_NAME", "FoundNear"),
+	})
+
+	// Security and request middleware
+	app.Use(requestid.New())
+	app.Use(middleware.Recovery())
+	app.Use(cors.New())
+	app.Use(helmet.New())
+	app.Use(middleware.RequestLogger())
+
+	// Initialize repositories
+	userRepo := repository.NewUserRepository(db)
+	roleRepo := repository.NewRoleRepository(db)
+
+	// Initialize services
+	jwtSecret := GetEnv("JWT_SECRET", "")
+	authService := service.NewAuthService(
+		userRepo,
+		roleRepo,
+		jwtSecret,
+	)
+
+	// Register routes
+	route.RegisterHealthRoute(app)
+	route.RegisterAuthRoute(app, authService, jwtSecret)
+
+	return app
+}
+
+========== config\env.go ==========
+
+package config
+
+import (
+	"fmt"
+	"log"
+	"os"
+
+	"github.com/joho/godotenv"
+)
+
+func LoadEnv() {
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using system environment variables")
+	}
+}
+
+func GetEnv(key string, fallback string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func GetDatabaseURL() string {
+	return fmt.Sprintf(
+		"postgres://%s:%s@%s:%s/%s?sslmode=%s",
+		GetEnv("DB_USER", "postgres"),
+		GetEnv("DB_PASSWORD", ""),
+		GetEnv("DB_HOST", "localhost"),
+		GetEnv("DB_PORT", "5432"),
+		GetEnv("DB_NAME", "foundnear"),
+		GetEnv("DB_SSLMODE", "disable"),
+	)
+}
